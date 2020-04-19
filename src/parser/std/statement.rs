@@ -1,11 +1,46 @@
 use crate::parser::ast;
 use crate::lexer;
 use crate::logger::logger::{Error, Logger};
-use crate::parser::{ ast::{ Node }, parser::Parser };
+use crate::parser::{ ast::{ Node }, parser::Parser, custom_syntax::Impl, custom_syntax };
+use std::collections::HashMap;
+use crate::parser::gen_utils as g;
 
-impl Parser<'_> {
-    // Returns Node::Nodes
-    pub fn std_statement_parse<'a>(parser: &mut Parser<'a>) -> Result<ast::Node, Error> {
+pub fn generate_statement_run_parser() -> custom_syntax::Custom {
+    // Note we want to keep the pattern the same as the way we parsed it.
+    let mut rule: HashMap<ast::NameID, ast::Node> = HashMap::new();
+    
+    rule.insert(
+        // expr is the thing the metasyntax looks for, don't touch this
+        // (has nothing to do with the non terminal below)
+        g::new_name_id("expr"), 
+
+        // Parse a block
+        ast::Node::NonTerminal(
+            g::new_non_terminal(
+                g::new_dollar_sign("pattern_rules"), // this is the `$pattern_rules`
+                g::new_production_grammar_expr(g::new_namespace_production(g::new_namespace(vec!["syntax", "block"])))
+            )
+        )
+    );
+
+    custom_syntax::Custom {
+        custom_type: g::new_namespace(vec!["syntax", "pattern", "pattern"]),
+
+        values: rule,
+
+        // syntax::pattern::parse
+        name: g::new_namespace(vec!["syntax", "statement", "run"]),
+        pos: g::gp(),
+
+        rep: "pattern std definition".to_string(),
+
+        scope: ast::Scope::Outer,
+    }
+}
+
+impl<'a> Parser<'a> {
+    // Should return impl with patterns complete, that way the std_pattern_pattern can use it and parse it.
+    pub fn std_statement_parse(parser: &'a mut Parser<'a>) -> Result<ast::Node, Error> {
         let position = parser.lexer.get_pos();
         let mut items: Vec<Node> = Vec::new();
         let mut errors: Vec<Error> = Vec::new();
@@ -47,8 +82,8 @@ impl Parser<'_> {
         }))
     }
 
-    // Returns Node::Nodes
-    pub fn std_statement_run<'a>(parser: &mut Parser<'a>) -> Result<ast::Node, Error> {
+    // Should return impl with patterns complete
+    pub fn std_statement_run(parser: &'a mut Parser<'a>) -> Result<ast::Node, Error> {
         let position = parser.lexer.get_pos();
 
         let mut items: Vec<Node> = Vec::new();
@@ -62,8 +97,8 @@ impl Parser<'_> {
         }))
     }
 
-    // Returns CustomStatement object
-    pub fn std_statement_statement<'a>(parser: &mut Parser<'a>, ) /* -> Result<ast::Node, Error> */ {
-
+    // Returns impl object, generates parse and replace functions
+    pub fn std_statement_statement(parser: &mut Parser<'a>, impl_curr: &'a Impl) -> Result<&'a Impl, Error> {
+        Ok(impl_curr)
     }
 }

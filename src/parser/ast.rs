@@ -2,7 +2,9 @@ use crate::helpers;
 use std::fmt::Debug;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use crate::parser::custom_syntax::{ Custom, Pattern, Terminal, NonTerminal, Impl };
+use crate::parser::custom_syntax::{ Custom, Pattern, Terminal, NonTerminal, Impl, DollarID };
+use crate::logger::logger::{ Error, ErrorDisplayType, ErrorAnnotation, ErrorType };
+use crate::parser::parser::Parser;
 
 // EXPRESSIONS ---------------------------------------
 
@@ -23,13 +25,6 @@ pub struct Integer {
 /// String literal node
 pub struct StringLiteral {
     pub value: String,
-    pub pos: helpers::Pos
-}
-
-#[derive(Debug)]
-/// Dollar sign id (i.e. `$myvar`) node
-pub struct DollarID {
-    pub value: NameID,
     pub pos: helpers::Pos
 }
 
@@ -94,7 +89,7 @@ pub struct Neg {
 
 // NODES ---------------------------------------	
 
-#[derive(Debug, Eq)]
+#[derive(Debug, Eq, Clone)]
 /// Name ID node
 pub struct NameID {
     pub value: String,
@@ -207,11 +202,23 @@ pub struct Type {
     pub pos: helpers::Pos
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq)]
 /// This::is::a::namespace!
 pub struct Namespace {
     pub scopes: Vec<NameID>,
     pub pos: helpers::Pos
+}
+
+impl Hash for Namespace {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.scopes.hash(state);
+    }
+}
+
+impl PartialEq for Namespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.scopes == other.scopes
+    }
 }
 
 impl fmt::Display for Namespace {
@@ -229,6 +236,44 @@ impl fmt::Display for Namespace {
 pub struct Nodes {
     pub nodes: Vec<Node>,
     pub pos: helpers::Pos
+}
+
+impl Nodes {
+    // Generate grammar
+    pub fn generate(&self, parser: &mut Parser) -> Result<Box<dyn Fn (&mut Parser) -> Result<Node, Error>>, Error> {
+        let mut functions = Vec::new();
+
+        for node in self.nodes {
+            match node {
+                Node::NonTerminal(val) => {
+                    functions.push(val.generate(parser));
+                },
+                Node::Terminal(val) => {
+                    functions.push(val.generate(parser));
+                },
+                _ => {
+                    return Err(Error::new(
+                        format!("wrong format for syntax generation"), 
+                        ErrorType::UndefinedSyntax, 
+                        self.pos, 
+                        ErrorDisplayType::Error, 
+                        parser.lexer.filename.clone(), 
+                        vec![
+                            ErrorAnnotation::new(Some("".to_string()), self.pos, ErrorDisplayType::Error, parser.lexer.filename.clone())
+                        ], 
+                        true
+                    ))
+                }
+            }
+        }
+
+        Ok(Box::new(move |parser| { 
+            for function in &functions {
+
+            }; 
+            Ok(Node::Empty(Empty { pos: helpers::Pos::new(0, 0) }))
+        }))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -295,7 +340,8 @@ pub enum Statement {
     FunctionDefine(FunctionDefine),
     ImplDefine(Impl),
 
-    Empty(Empty)
+    Empty(Empty),
+    DollarID(DollarID),
 }
 
 impl Statement {
@@ -306,7 +352,8 @@ impl Statement {
             Statement::VariableDeclaration(val) => val.pos,
             Statement::FunctionDefine(val) => val.pos,
             Statement::ImplDefine(val) => val.pos,
-            Statement::Empty(val) => val.pos
+            Statement::Empty(val) => val.pos,
+            Statement::DollarID(val) => val.pos
         }
     }
 
@@ -317,7 +364,8 @@ impl Statement {
             Statement::VariableDeclaration(_) => "variable declaration".to_string(),
             Statement::FunctionDefine(_) => "function define".to_string(),
             Statement::ImplDefine(_) => "impl statement".to_string(),
-            Statement::Empty(_) => "empty statement".to_string()
+            Statement::Empty(_) => "empty statement".to_string(),
+            Statement::DollarID(_) => "dollar id".to_string()
         }
     }
 
@@ -332,7 +380,8 @@ impl Statement {
             Statement::VariableDeclaration(_) => &Scope::Block,
             Statement::FunctionDefine(_) => &Scope::Outer,
             Statement::ImplDefine(_) => &Scope::Outer,
-            Statement::Empty(_) => &Scope::All
+            Statement::Empty(_) => &Scope::All,
+            Statement::DollarID(_) => &Scope::Block
         }
     }
 
@@ -343,7 +392,8 @@ impl Statement {
             Statement::VariableDeclaration(val) => Node::VariableDeclaration(val),
             Statement::FunctionDefine(val) => Node::FunctionDefine(val),
             Statement::ImplDefine(val) => Node::ImplDefine(val),
-            Statement::Empty(val) => Node::Empty(val)
+            Statement::Empty(val) => Node::Empty(val),
+            Statement::DollarID(val) => Node::DollarID(val)
         } 
     }
 }

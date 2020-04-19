@@ -11,13 +11,13 @@ pub struct Master<'a> {
     modules: HashMap<String, CodeGenModule<'a>>,
 }
 
-impl<'a> Master<'a> {
-    pub fn new(context: &'a Context) -> Master<'a> {
+impl Master<'_> {
+    pub fn new<'a>(context: &'a Context) -> Master<'a> {
         let logger = logger::logger::Logger::new();
         Master { context, modules: HashMap::new(), logger }
     }
 
-    pub fn add_file(&mut self, filename: String) {
+    pub fn add_file<'a>(&'a mut self, filename: String) {
         let code_gen_mod = CodeGenModule::new(self.context.create_module(&filename[..]), filename.clone());
         
         match code_gen_mod {

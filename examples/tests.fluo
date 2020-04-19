@@ -13,6 +13,17 @@ impl useless_print -> syntax::statement::statement {
     }
 }
 
+-- Default pattern definition
+impl my_pattern -> syntax::pattern::pattern {
+    pattern syntax::pattern::parse {
+        $expr: ( syntax::nonterminal | syntax::terminal ) * -> ","  -- allows for trailing comma
+    }
+
+    pattern syntax::pattern::run {
+        $expr
+    }
+}
+
 -- import tests2;
 
 -- Entry function: only run if this file is the one being run

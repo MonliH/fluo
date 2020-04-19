@@ -1,12 +1,13 @@
 use crate::parser::ast;
 use crate::lexer;
 use crate::logger::logger::{Error, ErrorType, Logger, ErrorDisplayType, ErrorAnnotation};
-use crate::parser::ast::{ Statement, Expr, Scope, Node };
+use crate::parser::ast::{ Statement, Expr, Scope };
 use crate::helpers;
 use crate::codegen::module_codegen::CodeGenModule;
-use crate::parser:: { custom_syntax, custom_syntax::Pattern };
+use crate::parser:: { custom_syntax, custom_syntax::Impl };
+use crate::parser::gen_utils as g;
 use crate::parser::std::generate;
-
+use std::collections::HashMap;
 
 /// Recursive descent parser
 pub struct Parser<'a> {
@@ -15,18 +16,18 @@ pub struct Parser<'a> {
     /// Abstract syntax tree
     pub ast: Option<ast::Block>,
     pub modules: Vec<CodeGenModule<'a>>,
-    statements: Vec<fn (&mut Self) -> Result<Statement, Error>>,
-    customs: custom_syntax::NamespaceObj
+    statements: Vec<fn (&'a mut Self) -> Result<Statement, Error>>,
+    customs: custom_syntax::NamespaceObj<'a>
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     /// Return a new parser object.
     /// 
     /// Arguments
     /// 
     /// * `l`: lexer to use
     /// * `log`: logger to use
-    pub fn new<'a>(l: lexer::Lexer) -> Parser<'a> {
+    pub fn new(l: lexer::Lexer) -> Parser<'a> {
         Parser { 
             lexer: l, 
             ast: None, 
@@ -37,7 +38,7 @@ impl Parser<'_> {
     }
     
     /// Template for syntax error
-    pub fn syntax_error(&self, t: lexer::Token, message: &str, is_keyword: bool, urgent: bool) -> Error {
+    pub fn syntax_error(&'a self, t: lexer::Token, message: &str, is_keyword: bool, urgent: bool) -> Error {
         Error::new(
             String::from(
                 if !is_keyword { 
@@ -58,7 +59,7 @@ impl Parser<'_> {
     }
 
     /// Validate next token
-    pub fn next(&mut self, token_type: lexer::TokenType, position: (usize, usize), is_keyword: bool) -> Result<(), Error> {
+    pub fn next(&'a mut self, token_type: lexer::TokenType, position: (usize, usize), is_keyword: bool) -> Result<(), Error> {
         let t = self.lexer.advance()?.clone();
         
         if t.token != token_type {
@@ -69,7 +70,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn position(&mut self, position: (usize, usize)) -> helpers::Pos {
+    pub fn position(&'a mut self, position: (usize, usize)) -> helpers::Pos {
         helpers::Pos {
             s: position.0,
             e: self.lexer.position
@@ -79,7 +80,7 @@ impl Parser<'_> {
     /// Parse from lexer
     /// 
     /// Returns nothing
-    pub fn parse(&mut self) -> Result<(), Vec<Error>> {
+    pub fn parse(&'a mut self) -> Result<(), Vec<Error>> {
         let position = self.lexer.get_pos();
 
         // Set our scope to outside
@@ -134,7 +135,7 @@ impl Parser<'_> {
     }
 
     /// Parse basic block
-    pub fn block(&mut self) -> Result<ast::Block, Error> {
+    pub fn block(&'a mut self) -> Result<ast::Block, Error> {
         let position = self.lexer.get_pos();
         
         self.next(lexer::TokenType::LCP, position, false)?;
@@ -185,16 +186,13 @@ impl Parser<'_> {
     }
 
     
-    pub fn eval_impl(&mut self, impl_block: &ast::Statement) {
-        match impl_block {
-            ast::Statement::ImplDefine(impl_block) => {
-                
-            },
-            _ => {}
-        };
+    pub fn eval_impl(&'a mut self, impl_block: custom_syntax::Impl) -> Result<(), Error> {
+        let impl_final = self.get_metasyntax(&impl_block.metasyntax)?(self, &impl_block)?;
+        self.set_namespace_obj(impl_final.name.clone(), custom_syntax::NamespaceObj::Syntax(impl_final))?;
+        Ok(())
     }
 
-    pub fn parse_impl(&mut self) -> Result<Statement, Error> {
+    pub fn parse_impl(&'a mut self) -> Result<Statement, Error> {
         let position = self.lexer.get_pos();
 
         self.next(lexer::TokenType::IMPL, position, true)?;
@@ -207,7 +205,7 @@ impl Parser<'_> {
 
         self.next(lexer::TokenType::LCP, position, false)?;
 
-        let mut patterns: Vec<Pattern> = Vec::new();
+        let mut patterns: HashMap<String, custom_syntax::Custom> = HashMap::new();
 
         loop {
             if self.lexer.peek()?.token == lexer::TokenType::RCP {
@@ -215,72 +213,114 @@ impl Parser<'_> {
                 break
             }
 
-            let pattern = self.parse_pattern()?;
-            patterns.push(pattern);
+            let pattern = Parser::parse_pattern(self)?;
+
+            // TODO: fix this :)
+            patterns.insert(pattern.name.scopes.last().unwrap().value.clone(), pattern);
         }
 
         self.next(lexer::TokenType::RCP, position, false)?;
 
-        let final_impl = ast::Statement::ImplDefine( custom_syntax::Impl {
+        let impl_node = custom_syntax::Impl {
             patterns,
             name: name,
-            pos: self.position(position),
-            syntax_type: impl_type,
+            pos: (self.position(position)).clone(),
+            metasyntax: impl_type,
             operations: None
-        });
+        };
 
-        self.eval_impl(&final_impl);
+        let temp_pos = impl_node.pos;
 
-        Ok(ast::Statement::Empty(ast::Empty {
-            pos: match final_impl { ast::Statement::ImplDefine(custom) => custom.pos, _ => helpers::Pos::new(0, 0) }
-        }))
+        self.eval_impl(impl_node)?;
+
+        Ok(ast::Statement::Empty(ast::Empty { pos: temp_pos }))
     }
 
-    pub fn get_grammar<'a>(&mut self, namespace: &ast::Namespace) -> Result<&fn (&mut Parser) -> Result<Node, Error>, Error> {
+    pub fn set_namespace_obj(&'a mut self, name: ast::NameID, value: custom_syntax::NamespaceObj<'a>) -> Result<(), Error> {
+        if let custom_syntax::NamespaceObj::ParserNamespace(mut objects) = &self.customs {
+            if objects.contains_key(&name) {
+                return Err( Error::new (
+                    format!("syntax or namespace `{}` already exists", name.value),
+                    ErrorType::UndefinedSyntax,
+                    name.pos,
+                    ErrorDisplayType::Error,
+                    self.lexer.filename.clone(),
+                    vec![
+                        ErrorAnnotation::new(Some(format!("`{}` already exists in this scope", name.value)), name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                    ],
+                    true  // High priority error
+                ) )
+            } else {
+                objects.insert(name, value);
+            }
+        }
+        
+        Ok(())
+    }
+
+    pub fn get_namespace_obj(&'a self, namespace: &'a ast::Namespace) -> Result<(&custom_syntax::NamespaceObj<'a>, &'a ast::NameID), Error> {
         // Get a certain grammar from namespace
-        let mut prev_name = &namespace.scopes[0];
+        let mut prev_name: Option<&ast::NameID> = None;
         let mut prev_namespace = &self.customs;
 
         if namespace.scopes.len() > 1 {
-            for name in &namespace.scopes[1..] {
-                if let custom_syntax::NamespaceObj::ParserNamespace { objects } = prev_namespace {
+            for name in &namespace.scopes {
+                if let custom_syntax::NamespaceObj::ParserNamespace(objects) = prev_namespace {
                     if objects.contains_key(&name) {
-                        prev_name = name;
+                        prev_name = Some(name);
                         prev_namespace = &objects[&name];
                     } else {
                         // Namespace doesn't exit in namespace
                         return Err( Error::new (
-                            format!("namespace `{}` has no member `{}`", prev_name.value, name.value),
+                            format!("namespace `{}` has no member `{}`", prev_name.unwrap().value, name.value),
                             ErrorType::UndefinedSyntax,
                             name.pos,
                             ErrorDisplayType::Error,
                             self.lexer.filename.clone(),
                             vec![
-                                ErrorAnnotation::new(Some(format!("not a pattern in `{}`", prev_name.value)), name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                                ErrorAnnotation::new(Some(format!("not a pattern in `{}`", prev_name.unwrap().value)), name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
                             ],
                             true  // High priority error
                         ) );
                     }
                 } else {
-                    // Namespace doesn't exist because its a syntax
-                    // Namespace doesn't exist in namespace
+                    // Namespace doesn't exist because it's a syntax
                     return Err( Error::new (
-                        format!("syntax `{}` has no member `{}`", prev_name.value, name.value),
+                        format!("syntax `{}` has no member `{}`", prev_name.unwrap().value, name.value),
                         ErrorType::UndefinedSyntax,
                         name.pos,
                         ErrorDisplayType::Error,
                         self.lexer.filename.clone(),
                         vec![
-                            ErrorAnnotation::new(Some(format!("not a pattern in `{}`", prev_name.value)), name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                            ErrorAnnotation::new(Some(format!("not a pattern syntax in `{}`", prev_name.unwrap().value)), name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
                         ],
                         true  // High priority error
                     ) );
                 }
             };
+        } else {
+            // Namespace is empty
+            return Err( Error::new (
+                format!("namespace is empty"),
+                ErrorType::UndefinedSyntax,
+                namespace.pos,
+                ErrorDisplayType::Error,
+                self.lexer.filename.clone(),
+                vec![
+                    ErrorAnnotation::new(Some(format!("not a pattern syntax in `{}`", prev_name.unwrap().value)), namespace.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                ],
+                true  // High priority error
+            ) );
         }
 
+        Ok((prev_namespace, prev_name.unwrap()))
+    }
+
+    pub fn get_syntax(&'a self, namespace: &'a ast::Namespace) -> Result<&'a custom_syntax::Impl, Error> {
+        let (prev_namespace, prev_name) = self.get_namespace_obj(namespace)?;
+
         match prev_namespace {
-            custom_syntax::NamespaceObj::ParserNamespace { objects: _ } => {
+            custom_syntax::NamespaceObj::ParserNamespace(_) => {
                 // This is a namespace, not a syntax
                 Err(Error::new (
                     format!("expected syntax, found namespace"),
@@ -289,52 +329,66 @@ impl Parser<'_> {
                     ErrorDisplayType::Error,
                     self.lexer.filename.clone(),
                     vec![
-                        ErrorAnnotation::new(Some(format!("{} is a namespace, not a syntax", prev_name.value)), prev_name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                        ErrorAnnotation::new(Some(format!("`{}` is a namespace, not a syntax", prev_name.value)), prev_name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
                     ],
                     true  // High priority error
                 ))
             },
-            custom_syntax::NamespaceObj::ParserRule(rule) => Ok(&rule)
+            custom_syntax::NamespaceObj::Metasyntax(_) => {
+                // This is a namespace, not a syntax
+                Err(Error::new (
+                    format!("expected syntax, found metasyntax"),
+                    ErrorType::UndefinedSyntax,
+                    namespace.pos,
+                    ErrorDisplayType::Error,
+                    self.lexer.filename.clone(),
+                    vec![
+                        ErrorAnnotation::new(Some(format!("`{}` is a metasyntax, not a syntax", prev_name.value)), prev_name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                    ],
+                    true  // High priority error
+                ))
+            },
+            custom_syntax::NamespaceObj::Syntax(impl_rule) => Ok(impl_rule)
         }
     }
 
-    pub fn parse_pattern(&mut self) -> Result<Pattern, Error> {
-        let position = self.lexer.get_pos();
+    pub fn get_metasyntax(&'a self, namespace: &'a ast::Namespace) -> Result<&fn (&mut Parser<'a>, &'a Impl) -> Result<&'a Impl, Error>, Error> {
+        let (prev_namespace, prev_name) = self.get_namespace_obj(namespace)?;
 
-        self.next(lexer::TokenType::PATTERN, position, true)?;
-
-        let prototype = self.namespace()?;
-
-        // TODO: parse_std_parse
-        let items = match self.get_grammar(&prototype) {
-            Ok(parser_func) => {
-                match parser_func(self) {
-                    Ok(Node::Nodes(nodes)) => {nodes},
-                    Ok(_) => { return Err( Error::new (
-                        format!("`{}` is not a pattern syntax", prototype),
-                        ErrorType::SyntaxTypeError,
-                        prototype.pos,
-                        ErrorDisplayType::Error,
-                        self.lexer.filename.clone(),
-                        vec![
-                            ErrorAnnotation::new(Some("not a pattern".to_string()), prototype.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
-                        ],
-                        true  // High priority error
-                    ))},
-                    Err(e) => return Err(e)
-                }
+        match prev_namespace {
+            custom_syntax::NamespaceObj::ParserNamespace(_) => {
+                // This is a namespace, not a syntax
+                Err(Error::new (
+                    format!("expected meta syntax, found namespace"),
+                    ErrorType::UndefinedSyntax,
+                    namespace.pos,
+                    ErrorDisplayType::Error,
+                    self.lexer.filename.clone(),
+                    vec![
+                        ErrorAnnotation::new(Some(format!("`{}` is a namespace, not a meta syntax", prev_name.value)), prev_name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                    ],
+                    true  // High priority error
+                ))
             },
-            Err(e) => return Err(e)
-        };
-
-        Ok(custom_syntax::Pattern {
-            prototype,
-            contents: items.nodes,
-            pos: self.position(position)
-        })
+            custom_syntax::NamespaceObj::Syntax(_) => {
+                // This is a syntax, not a metasyntax
+                Err(Error::new (
+                    format!("expected metasyntax, found syntax"),
+                    ErrorType::UndefinedSyntax,
+                    namespace.pos,
+                    ErrorDisplayType::Error,
+                    self.lexer.filename.clone(),
+                    vec![
+                        ErrorAnnotation::new(Some(format!("`{}` is a syntax, not a meta syntax", prev_name.value)), prev_name.pos, ErrorDisplayType::Error, self.lexer.filename.clone())
+                    ],
+                    true  // High priority error
+                ))
+            },
+            custom_syntax::NamespaceObj::Metasyntax(rule) => Ok(rule)
+        }
     }
 
-    pub fn parse_non_terminal(&mut self) -> Result<custom_syntax::NonTerminal, Error> {
+    pub fn parse_non_terminal(&'a mut self) -> Result<custom_syntax::NonTerminal, Error> {
         // Something that looks like this:
         // `$my_non_terminal: syntax::expr`
         let position = self.lexer.get_pos();
@@ -345,10 +399,10 @@ impl Parser<'_> {
 
         let namespace = self.namespace()?;
 
-        Ok(custom_syntax::NonTerminal { name, prototype: namespace, pos: self.position(position) })
+        Ok(custom_syntax::NonTerminal { name, grammar: g::new_production_grammar_expr(g::new_namespace_production(namespace)), pos: self.position(position) })
     }
     
-    pub fn parse_terminal(&mut self) -> Result<custom_syntax::Terminal, Error> {
+    pub fn parse_terminal(&'a mut self) -> Result<custom_syntax::Terminal, Error> {
         // String literals
         let position = self.lexer.get_pos();
 
@@ -357,7 +411,7 @@ impl Parser<'_> {
         Ok(custom_syntax::Terminal { contents: literal, pos: self.position(position) })
     }
 
-    pub fn parse_arguments(&mut self) -> Result<ast::Arguments, Error> {
+    pub fn parse_arguments(&'a mut self) -> Result<ast::Arguments, Error> {
         let position = self.lexer.get_pos();
         let mut positional_args: Vec<(ast::NameID, ast::Type)> = Vec::new();
 
@@ -389,7 +443,7 @@ impl Parser<'_> {
     }
 
     /// Parse function definition
-    pub fn function_define(&mut self) -> Result<Statement, Error> {
+    pub fn function_define(&'a mut self) -> Result<Statement, Error> {
         let position = self.lexer.get_pos();
         
         self.next(lexer::TokenType::DEF, position, true)?;
@@ -427,7 +481,7 @@ impl Parser<'_> {
     }
 
     /// Expressions statement
-    pub fn expression_statement(&mut self) -> Result<Statement, Error> {
+    pub fn expression_statement(&'a mut self) -> Result<Statement, Error> {
         let position = self.lexer.get_pos();
 
         let expr = self.expr()?;
@@ -440,7 +494,7 @@ impl Parser<'_> {
         }))
     }
 
-    pub fn arguments_call(&mut self) -> Result<ast::ArgumentsRun, Error> {
+    pub fn arguments_call(&'a mut self) -> Result<ast::ArgumentsRun, Error> {
         let position = self.lexer.get_pos();
         let mut positional_args: Vec<Expr> = Vec::new();
 
@@ -467,7 +521,7 @@ impl Parser<'_> {
         })
     }
 
-    pub fn function_call(&mut self) -> Result<Expr, Error> {
+    pub fn function_call(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
 
         let namespace = self.namespace()?;
@@ -486,7 +540,7 @@ impl Parser<'_> {
     }
 
     /// Ful variable assign with type declaration and expression
-    pub fn variable_assign_full(&mut self) -> Result<Expr, Error> {
+    pub fn variable_assign_full(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
         self.next(lexer::TokenType::LET, position, true)?;
 
@@ -509,7 +563,7 @@ impl Parser<'_> {
     }
 
     /// Variable Declaration
-    pub fn variable_declaration(&mut self) -> Result<Statement, Error> {
+    pub fn variable_declaration(&'a mut self) -> Result<Statement, Error> {
         let position = self.lexer.get_pos();
         self.next(lexer::TokenType::LET, position, true)?;
 
@@ -529,7 +583,7 @@ impl Parser<'_> {
     }
 
     /// Variable assign with only expression
-    pub fn variable_assign(&mut self) -> Result<Expr, Error> {
+    pub fn variable_assign(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
 
         let namespace = self.namespace()?;
@@ -546,7 +600,7 @@ impl Parser<'_> {
     }
 
     /// Top level expression
-    pub fn expr(&mut self) -> Result<Expr, Error> {
+    pub fn expr(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
 
         let mut left = self.term()?;
@@ -580,7 +634,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn term(&mut self) -> Result<Expr, Error> {
+    pub fn term(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
         
         let mut left = self.factor()?;
@@ -625,7 +679,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn factor(&mut self) -> Result<Expr, Error> {
+    pub fn factor(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
         
         match self.next(lexer::TokenType::SUB, position, false) {
@@ -655,7 +709,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn item(&mut self) -> Result<Expr, Error> {
+    pub fn item(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
         let mut errors: Vec<Error> = Vec::new();
 
@@ -697,7 +751,7 @@ impl Parser<'_> {
         Err(Logger::longest(errors))
     }
 
-    pub fn integer(&mut self) -> Result<Expr, Error> {
+    pub fn integer(&'a mut self) -> Result<Expr, Error> {
         let position = self.lexer.get_pos();
 
         let int = self.lexer.advance()?.clone();
@@ -714,7 +768,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn string_literal(&mut self) -> Result<ast::StringLiteral, Error> {
+    pub fn string_literal(&'a mut self) -> Result<ast::StringLiteral, Error> {
         let position = self.lexer.get_pos();
 
         let string = self.lexer.advance()?.clone();
@@ -731,7 +785,7 @@ impl Parser<'_> {
         }
     }
 
-    pub fn namespace(&mut self) -> Result<ast::Namespace, Error> {
+    pub fn namespace(&'a mut self) -> Result<ast::Namespace, Error> {
         let position = self.lexer.get_pos();
         let mut ids: Vec<ast::NameID> = Vec::new();
         let id = self.name_id()?;
@@ -758,7 +812,7 @@ impl Parser<'_> {
     }
 
     /// Parse name identifier (i.e. function name)
-    pub fn name_id(&mut self) -> Result<ast::NameID, Error> {
+    pub fn name_id(&'a mut self) -> Result<ast::NameID, Error> {
         let position = self.lexer.get_pos();
         let id = self.lexer.advance()?.clone();
         if let lexer::TokenType::IDENTIFIER(value) = &id.token {
@@ -775,7 +829,7 @@ impl Parser<'_> {
     }
 
     /// Parse type expression
-    pub fn type_expr(&mut self) -> Result<ast::Type, Error> {
+    pub fn type_expr(&'a mut self) -> Result<ast::Type, Error> {
         // TODO: add tuple type  
         let namespace = self.namespace()?;
 
@@ -788,13 +842,13 @@ impl Parser<'_> {
     }
 
     /// Parse dollar id
-    pub fn dollar_id(&mut self) -> Result<ast::DollarID, Error> {
+    pub fn dollar_id(&'a mut self) -> Result<custom_syntax::DollarID, Error> {
         let position = self.lexer.get_pos();
 
         self.next(lexer::TokenType::DOLLAR, position, false)?;
         let id = self.name_id()?;
 
-        Ok(ast::DollarID {
+        Ok(custom_syntax::DollarID {
             value: id,
             pos: self.position(position)
         })
