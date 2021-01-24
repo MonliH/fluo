@@ -1,1 +1,9 @@
-let test<x:hi> = 10
+let entry = () :: i32 {
+    let y = 0
+    -- let test: i64 = x(x(y))
+    return x(y)
+}
+
+let x = (a: _) :: _ {
+    return a
+}
